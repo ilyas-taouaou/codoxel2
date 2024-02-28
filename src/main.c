@@ -76,6 +76,7 @@ typedef struct {
 
     VkBuffer vertex_buffer;
     VkBuffer index_buffer;
+    VkBuffer staging_buffer;
 } App;
 
 void show_window(App const *app, int const nCmdShow) { ShowWindow(app->window, nCmdShow); }
@@ -660,24 +661,67 @@ void create_buffers(App *app) {
     };
     constexpr uint32_t index_data[] = {0, 1, 2};
 
-    VkDeviceMemory vertex_buffer_memory, index_buffer_memory;
+    VkDeviceMemory staging_buffer_memory, vertex_buffer_memory, index_buffer_memory;
 
+    app->staging_buffer = create_buffer(app, sizeof(vertex_data) + sizeof(index_data), &staging_buffer_memory,
+                                        VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+                                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     app->vertex_buffer = create_buffer(app, sizeof(vertex_data), &vertex_buffer_memory,
-                                       VK_BUFFER_USAGE_VERTEX_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                                       VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
     app->index_buffer = create_buffer(app, sizeof(index_data), &index_buffer_memory,
-                                      VK_BUFFER_USAGE_INDEX_BUFFER_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+                                      VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
+                                      VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
-    void *buffer_vertex_data, *buffer_index_data;
-    vkMapMemory(app->device, vertex_buffer_memory, 0, VK_WHOLE_SIZE, 0, &buffer_vertex_data);
-    vkMapMemory(app->device, index_buffer_memory, 0, VK_WHOLE_SIZE, 0, &buffer_index_data);
+    void *buffer_staging_data;
+    vkMapMemory(app->device, staging_buffer_memory, 0, VK_WHOLE_SIZE, 0, &buffer_staging_data);
+    memcpy(buffer_staging_data, vertex_data, sizeof(vertex_data));
+    memcpy((char*)buffer_staging_data + sizeof(vertex_data), index_data, sizeof(index_data));
+    vkUnmapMemory(app->device, staging_buffer_memory);
 
-    memcpy(buffer_vertex_data, vertex_data, sizeof(vertex_data));
-    memcpy(buffer_index_data, index_data, sizeof(index_data));
+    auto const vkAllocateCommandBuffers = (PFN_vkAllocateCommandBuffers)app->vkGetDeviceProcAddr(
+        app->device, "vkAllocateCommandBuffers");
+    auto const vkBeginCommandBuffer = (PFN_vkBeginCommandBuffer)app->vkGetDeviceProcAddr(
+        app->device, "vkBeginCommandBuffer");
+    auto const vkEndCommandBuffer = (PFN_vkEndCommandBuffer)app->vkGetDeviceProcAddr(app->device, "vkEndCommandBuffer");
+    auto const vkCmdCopyBuffer = (PFN_vkCmdCopyBuffer)app->vkGetDeviceProcAddr(app->device, "vkCmdCopyBuffer");
+    auto const vkQueueSubmit = (PFN_vkQueueSubmit)app->vkGetDeviceProcAddr(app->device, "vkQueueSubmit");
+    auto const vkCreateFence = (PFN_vkCreateFence)app->vkGetDeviceProcAddr(app->device, "vkCreateFence");
+    auto const vkWaitForFences = (PFN_vkWaitForFences)app->vkGetDeviceProcAddr(app->device, "vkWaitForFences");
+    auto const vkDestroyFence = (PFN_vkDestroyFence)app->vkGetDeviceProcAddr(app->device, "vkDestroyFence");
 
-    vkUnmapMemory(app->device, vertex_buffer_memory);
-    vkUnmapMemory(app->device, index_buffer_memory);
+    VkCommandBuffer command_buffer;
+    vkAllocateCommandBuffers(app->device, &(VkCommandBufferAllocateInfo){
+                                 .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+                                 .commandPool = app->command_pool,
+                                 .level = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+                                 .commandBufferCount = 1,
+                             },
+                             &command_buffer);
+
+    vkBeginCommandBuffer(command_buffer, &(VkCommandBufferBeginInfo){
+                             .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+                             .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+                         });
+    vkCmdCopyBuffer(command_buffer, app->staging_buffer, app->vertex_buffer, 1, &(VkBufferCopy){
+                        .size = sizeof(vertex_data),
+                    });
+    vkCmdCopyBuffer(command_buffer, app->staging_buffer, app->index_buffer, 1, &(VkBufferCopy){
+                        .size = sizeof(index_data),
+                        .srcOffset = sizeof(vertex_data),
+                    });
+    vkEndCommandBuffer(command_buffer);
+    VkFence fence;
+    vkCreateFence(app->device, &(VkFenceCreateInfo){
+                      .sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+                  }, nullptr, &fence);
+    vkQueueSubmit(app->queue, 1, &(VkSubmitInfo){
+                      .sType = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+                      .commandBufferCount = 1,
+                      .pCommandBuffers = &command_buffer,
+                  }, fence);
+    vkWaitForFences(app->device, 1, &fence, true, UINT64_MAX);
+    vkDestroyFence(app->device, fence, nullptr);
 }
 
 int WINAPI wWinMain(HINSTANCE const hInstance, HINSTANCE const, PWSTR const, int const nShowCmd) {
@@ -695,6 +739,7 @@ int WINAPI wWinMain(HINSTANCE const hInstance, HINSTANCE const, PWSTR const, int
     pick_physical_device(&app);
     create_device(&app);
 
+    create_command_pool(&app);
     create_buffers(&app);
     create_renderpass(&app);
     create_pipeline_layout(&app);
@@ -702,7 +747,6 @@ int WINAPI wWinMain(HINSTANCE const hInstance, HINSTANCE const, PWSTR const, int
     create_pipeline(&app);
     unload_shaders(&app);
 
-    create_command_pool(&app);
     allocate_command_buffers(&app);
     create_synchronization_objects(&app);
 
