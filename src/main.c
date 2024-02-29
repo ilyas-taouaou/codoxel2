@@ -2,8 +2,10 @@
 #define VK_NO_PROTOTYPES
 #define VK_USE_PLATFORM_WIN32_KHR
 
+#include <stdio.h>
 #include <windows.h>
 #include <vulkan/vulkan.h>
+#include <wincodec.h>
 
 // one window
 // minimal error handling
@@ -77,6 +79,12 @@ typedef struct {
     VkBuffer vertex_buffer;
     VkBuffer index_buffer;
     VkBuffer staging_buffer;
+
+    IWICImagingFactory *imaging_factory;
+    VkDescriptorPool descriptor_pool;
+    VkDescriptorSetLayout descriptor_set_layout;
+    VkDescriptorSet descriptor_set;
+    PFN_vkCmdBindDescriptorSets vkCmdBindDescriptorSets;
 } App;
 
 void show_window(App const *app, int const nCmdShow) { ShowWindow(app->window, nCmdShow); }
@@ -307,7 +315,9 @@ void render(App *const app) {
                          });
     app->vkCmdBindVertexBuffers(command_buffer, 0, 1, &app->vertex_buffer, &(VkDeviceSize){0});
     app->vkCmdBindIndexBuffer(command_buffer, app->index_buffer, 0, VK_INDEX_TYPE_UINT32);
-    app->vkCmdDrawIndexed(command_buffer, 3, 1, 0, 0, 0);
+    app->vkCmdBindDescriptorSets(command_buffer, VK_PIPELINE_BIND_POINT_GRAPHICS, app->pipeline_layout, 0, 1,
+                                 &app->descriptor_set, 0, nullptr);
+    app->vkCmdDrawIndexed(command_buffer, 6, 1, 0, 0, 0);
     app->vkCmdEndRenderPass(command_buffer);
     app->vkEndCommandBuffer(command_buffer);
 
@@ -421,6 +431,8 @@ void create_pipeline_layout(App *const app) {
         app->device, "vkCreatePipelineLayout");
     vkCreatePipelineLayout(app->device, &(VkPipelineLayoutCreateInfo){
                                .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+                               .setLayoutCount = 1,
+                               .pSetLayouts = &app->descriptor_set_layout,
                            },
                            nullptr, &app->pipeline_layout);
 }
@@ -590,6 +602,7 @@ void load_vulkan_functions(App *app) {
     app->vkQueueSubmit = (PFN_vkQueueSubmit)load_device_proc(app, "vkQueueSubmit");
     app->vkCmdBindVertexBuffers = (PFN_vkCmdBindVertexBuffers)load_device_proc(app, "vkCmdBindVertexBuffers");
     app->vkCmdBindIndexBuffer = (PFN_vkCmdBindIndexBuffer)load_device_proc(app, "vkCmdBindIndexBuffer");
+    app->vkCmdBindDescriptorSets = (PFN_vkCmdBindDescriptorSets)load_device_proc(app, "vkCmdBindDescriptorSets");
 }
 
 uint32_t find_memory_type(const VkPhysicalDeviceMemoryProperties *pMemoryProperties,
@@ -650,22 +663,76 @@ VkBuffer create_buffer(App const *const app, VkDeviceSize const size,
     return buffer;
 }
 
+typedef struct {
+    IWICBitmapDecoder *bitmap_decoder;
+    IWICBitmapFrameDecode *bitmap_frame;
+    IWICFormatConverter *format_converter;
+    UINT width, height;
+} ImageDecoder;
+
+HRESULT load_image(App const *app, wchar_t const *filename, ImageDecoder *decoder) {
+    HRESULT hr = app->imaging_factory->lpVtbl->CreateDecoderFromFilename(app->imaging_factory, filename,
+                                                                         nullptr, GENERIC_READ,
+                                                                         WICDecodeMetadataCacheOnLoad,
+                                                                         &decoder->bitmap_decoder);
+    if (FAILED(hr)) return hr;
+
+    // load first frame
+    hr = decoder->bitmap_decoder->lpVtbl->GetFrame(decoder->bitmap_decoder, 0, &decoder->bitmap_frame);
+    if (FAILED(hr)) return hr;
+
+    // convert to format32bppPBGRA
+    hr = app->imaging_factory->lpVtbl->CreateFormatConverter(app->imaging_factory, &decoder->format_converter);
+    if (FAILED(hr)) return hr;
+
+    // initialize format converter
+    hr = decoder->format_converter->lpVtbl->Initialize(decoder->format_converter,
+                                                       (IWICBitmapSource*)decoder->bitmap_frame, &
+                                                       GUID_WICPixelFormat32bppPBGRA,
+                                                       WICBitmapDitherTypeNone, nullptr, 0.0,
+                                                       WICBitmapPaletteTypeCustom);
+    if (FAILED(hr)) return hr;
+
+    return decoder->bitmap_frame->lpVtbl->GetSize(decoder->bitmap_frame, &decoder->width, &decoder->height);
+}
+
+void unload_image(ImageDecoder const *decoder) {
+    if (decoder->bitmap_decoder) decoder->bitmap_decoder->lpVtbl->Release(decoder->bitmap_decoder);
+    if (decoder->bitmap_frame) decoder->bitmap_frame->lpVtbl->Release(decoder->bitmap_frame);
+    if (decoder->format_converter) decoder->format_converter->lpVtbl->Release(decoder->format_converter);
+}
+
+HRESULT decode_image(ImageDecoder const *decoder, void *data) {
+    UINT const stride = decoder->width * 4;
+    return decoder->format_converter->lpVtbl->CopyPixels(decoder->format_converter, nullptr, stride,
+                                                         decoder->height * stride, (BYTE*)data);
+}
+
 void create_buffers(App *app) {
     auto const vkMapMemory = (PFN_vkMapMemory)app->vkGetDeviceProcAddr(app->device, "vkMapMemory");
     auto const vkUnmapMemory = (PFN_vkUnmapMemory)app->vkGetDeviceProcAddr(app->device, "vkUnmapMemory");
 
+    // quad
     Vec2 const vertex_data[] = {
-        {.x = 0.0f, .y = -0.5f},
-        {.x = 0.5f, .y = 0.5f},
-        {.x = -0.5f, .y = 0.5f},
+        {-1.0f, -1.0f},
+        {1.0f, -1.0f},
+        {-1.0f, 1.0f},
+        {1.0f, 1.0f},
     };
-    constexpr uint32_t index_data[] = {0, 1, 2};
+    constexpr uint32_t index_data[] = {0, 1, 2, 1, 2, 3};
+
+    ImageDecoder image_decoder = {};
+    load_image(app, RESOURCES_PATH L"images/Sample_3D.png", &image_decoder);
 
     VkDeviceMemory staging_buffer_memory, vertex_buffer_memory, index_buffer_memory;
 
-    app->staging_buffer = create_buffer(app, sizeof(vertex_data) + sizeof(index_data), &staging_buffer_memory,
-                                        VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
-                                        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+    size_t const image_size = image_decoder.width * image_decoder.height * 4;
+
+    app->staging_buffer = create_buffer(
+        app, sizeof(vertex_data) + sizeof(index_data) + image_size,
+        &staging_buffer_memory,
+        VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+        VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
     app->vertex_buffer = create_buffer(app, sizeof(vertex_data), &vertex_buffer_memory,
                                        VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
@@ -673,10 +740,106 @@ void create_buffers(App *app) {
                                       VK_BUFFER_USAGE_INDEX_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT,
                                       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
 
+    // create image
+    auto const vkCreateImage = (PFN_vkCreateImage)app->vkGetDeviceProcAddr(app->device, "vkCreateImage");
+    auto const vkGetImageMemoryRequirements = (PFN_vkGetImageMemoryRequirements)app->vkGetDeviceProcAddr(
+        app->device, "vkGetImageMemoryRequirements");
+    auto const vkCreateImageView = (PFN_vkCreateImageView)app->vkGetDeviceProcAddr(app->device, "vkCreateImageView");
+    auto const vkCreateSampler = (PFN_vkCreateSampler)app->vkGetDeviceProcAddr(app->device, "vkCreateSampler");
+
+    VkImage image;
+    vkCreateImage(app->device, &(VkImageCreateInfo){
+                      .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                      .imageType = VK_IMAGE_TYPE_2D,
+                      .format = VK_FORMAT_B8G8R8A8_SRGB,
+                      .extent = {
+                          .width = image_decoder.width,
+                          .height = image_decoder.height,
+                          .depth = 1,
+                      },
+                      .mipLevels = 1,
+                      .arrayLayers = 1,
+                      .samples = VK_SAMPLE_COUNT_1_BIT,
+                      .tiling = VK_IMAGE_TILING_OPTIMAL,
+                      .usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT,
+                      .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+                  },
+                  nullptr, &image);
+
+    // allocate memory for image
+    auto const vkGetPhysicalDeviceMemoryProperties = (PFN_vkGetPhysicalDeviceMemoryProperties)app->
+        vkGetInstanceProcAddr(app->instance, "vkGetPhysicalDeviceMemoryProperties");
+
+    VkPhysicalDeviceMemoryProperties memory_properties;
+    vkGetPhysicalDeviceMemoryProperties(app->physical_device, &memory_properties);
+
+    VkDeviceMemory image_memory;
+    VkMemoryRequirements memory_requirements;
+    vkGetImageMemoryRequirements(app->device, image, &memory_requirements);
+    uint32_t const memory_type_index = find_memory_type(&memory_properties, memory_requirements.memoryTypeBits,
+                                                        VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+
+    auto const vkAllocateMemory = (PFN_vkAllocateMemory)app->vkGetDeviceProcAddr(app->device, "vkAllocateMemory");
+    auto const vkBindImageMemory = (PFN_vkBindImageMemory)app->vkGetDeviceProcAddr(app->device, "vkBindImageMemory");
+
+    vkAllocateMemory(app->device, &(VkMemoryAllocateInfo){
+                         .sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+                         .allocationSize = memory_requirements.size,
+                         .memoryTypeIndex = memory_type_index,
+                     },
+                     nullptr, &image_memory);
+
+    vkBindImageMemory(app->device, image, image_memory, 0);
+
+    VkImageView image_view;
+    vkCreateImageView(app->device, &(VkImageViewCreateInfo){
+                          .sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+                          .image = image,
+                          .viewType = VK_IMAGE_VIEW_TYPE_2D,
+                          .format = VK_FORMAT_B8G8R8A8_SRGB,
+                          .subresourceRange = {
+                              .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                              .levelCount = 1,
+                              .layerCount = 1,
+                          },
+                      },
+                      nullptr, &image_view);
+
+    VkSampler sampler;
+    vkCreateSampler(app->device, &(VkSamplerCreateInfo){
+                        .sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+                        .magFilter = VK_FILTER_LINEAR,
+                        .minFilter = VK_FILTER_LINEAR,
+                        .addressModeU = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+                        .addressModeV = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+                        .addressModeW = VK_SAMPLER_ADDRESS_MODE_REPEAT,
+                    },
+                    nullptr, &sampler);
+
+    auto const vkUpdateDescriptorSets = (PFN_vkUpdateDescriptorSets)app->vkGetDeviceProcAddr(app->device,
+        "vkUpdateDescriptorSets");
+    vkUpdateDescriptorSets(app->device, 1, &(VkWriteDescriptorSet){
+                               .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+                               .dstSet = app->descriptor_set,
+                               .dstBinding = 0,
+                               .descriptorCount = 1,
+                               .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                               .pImageInfo = &(VkDescriptorImageInfo){
+                                   .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                                   .imageView = image_view,
+                                   .sampler = sampler,
+                               },
+                           },
+                           0, nullptr);
+
     void *buffer_staging_data;
     vkMapMemory(app->device, staging_buffer_memory, 0, VK_WHOLE_SIZE, 0, &buffer_staging_data);
-    memcpy(buffer_staging_data, vertex_data, sizeof(vertex_data));
-    memcpy((char*)buffer_staging_data + sizeof(vertex_data), index_data, sizeof(index_data));
+    size_t cursor = 0;
+    memcpy((char*)buffer_staging_data + cursor, vertex_data, sizeof(vertex_data));
+    cursor += sizeof(vertex_data);
+    memcpy((char*)buffer_staging_data + cursor, index_data, sizeof(index_data));
+    cursor += sizeof(index_data);
+    decode_image(&image_decoder, (char*)buffer_staging_data + cursor);
     vkUnmapMemory(app->device, staging_buffer_memory);
 
     auto const vkAllocateCommandBuffers = (PFN_vkAllocateCommandBuffers)app->vkGetDeviceProcAddr(
@@ -689,6 +852,10 @@ void create_buffers(App *app) {
     auto const vkCreateFence = (PFN_vkCreateFence)app->vkGetDeviceProcAddr(app->device, "vkCreateFence");
     auto const vkWaitForFences = (PFN_vkWaitForFences)app->vkGetDeviceProcAddr(app->device, "vkWaitForFences");
     auto const vkDestroyFence = (PFN_vkDestroyFence)app->vkGetDeviceProcAddr(app->device, "vkDestroyFence");
+    auto const vkCmdCopyBufferToImage = (PFN_vkCmdCopyBufferToImage)app->vkGetDeviceProcAddr(app->device,
+        "vkCmdCopyBufferToImage");
+    auto const vkCmdPipelineBarrier = (PFN_vkCmdPipelineBarrier)app->vkGetDeviceProcAddr(app->device,
+        "vkCmdPipelineBarrier");
 
     VkCommandBuffer command_buffer;
     vkAllocateCommandBuffers(app->device, &(VkCommandBufferAllocateInfo){
@@ -703,13 +870,56 @@ void create_buffers(App *app) {
                              .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
                              .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
                          });
+    cursor = 0;
     vkCmdCopyBuffer(command_buffer, app->staging_buffer, app->vertex_buffer, 1, &(VkBufferCopy){
                         .size = sizeof(vertex_data),
+                        .srcOffset = cursor,
                     });
+    cursor += sizeof(vertex_data);
     vkCmdCopyBuffer(command_buffer, app->staging_buffer, app->index_buffer, 1, &(VkBufferCopy){
                         .size = sizeof(index_data),
-                        .srcOffset = sizeof(vertex_data),
+                        .srcOffset = cursor,
                     });
+    cursor += sizeof(index_data);
+    vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
+                         0,
+                         nullptr, 1, &(VkImageMemoryBarrier){
+                             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                             .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                             .newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                             .image = image,
+                             .subresourceRange = {
+                                 .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                 .levelCount = 1,
+                                 .layerCount = 1,
+                             },
+                         });
+    vkCmdCopyBufferToImage(command_buffer, app->staging_buffer, image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1,
+                           &(VkBufferImageCopy){
+                               .imageSubresource = {
+                                   .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                   .layerCount = 1,
+                               },
+                               .imageExtent = {
+                                   .width = image_decoder.width,
+                                   .height = image_decoder.height,
+                                   .depth = 1,
+                               },
+                           });
+    vkCmdPipelineBarrier(command_buffer, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0, 0,
+                         nullptr, 0, nullptr, 1, &(VkImageMemoryBarrier){
+                             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+                             .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                             .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
+                             .oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+                             .newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
+                             .image = image,
+                             .subresourceRange = {
+                                 .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+                                 .levelCount = 1,
+                                 .layerCount = 1,
+                             },
+                         });
     vkEndCommandBuffer(command_buffer);
     VkFence fence;
     vkCreateFence(app->device, &(VkFenceCreateInfo){
@@ -724,6 +934,49 @@ void create_buffers(App *app) {
     vkDestroyFence(app->device, fence, nullptr);
 }
 
+void create_descriptor_pool(App *app) {
+    auto const vkCreateDescriptorPool = (PFN_vkCreateDescriptorPool)app->vkGetDeviceProcAddr(app->device,
+        "vkCreateDescriptorPool");
+    vkCreateDescriptorPool(app->device, &(VkDescriptorPoolCreateInfo){
+                               .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+                               .maxSets = 1,
+                               .poolSizeCount = 1,
+                               .pPoolSizes = &(VkDescriptorPoolSize){
+                                   .type = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                   .descriptorCount = 1,
+                               },
+                           },
+                           nullptr, &app->descriptor_pool);
+}
+
+void create_descriptor_set_layout(App *app) {
+    auto const vkCreateDescriptorSetLayout = (PFN_vkCreateDescriptorSetLayout)app->vkGetDeviceProcAddr(app->device,
+        "vkCreateDescriptorSetLayout");
+    vkCreateDescriptorSetLayout(app->device, &(VkDescriptorSetLayoutCreateInfo){
+                                    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+                                    .bindingCount = 1,
+                                    .pBindings = &(VkDescriptorSetLayoutBinding){
+                                        .binding = 0,
+                                        .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+                                        .descriptorCount = 1,
+                                        .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT,
+                                    },
+                                },
+                                nullptr, &app->descriptor_set_layout);
+}
+
+void create_descriptor_set(App *app) {
+    auto const vkAllocateDescriptorSets = (PFN_vkAllocateDescriptorSets)app->vkGetDeviceProcAddr(app->device,
+        "vkAllocateDescriptorSets");
+    vkAllocateDescriptorSets(app->device, &(VkDescriptorSetAllocateInfo){
+                                 .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+                                 .descriptorPool = app->descriptor_pool,
+                                 .descriptorSetCount = 1,
+                                 .pSetLayouts = &app->descriptor_set_layout,
+                             },
+                             &app->descriptor_set);
+}
+
 int WINAPI wWinMain(HINSTANCE const hInstance, HINSTANCE const, PWSTR const, int const nShowCmd) {
     App app = {
         .window_title = L"Minimal Window",
@@ -732,6 +985,14 @@ int WINAPI wWinMain(HINSTANCE const hInstance, HINSTANCE const, PWSTR const, int
         .hinstance = hInstance,
     };
 
+    HRESULT const hr = CoInitialize(nullptr);
+    if (FAILED(hr)) return 1;
+
+    // load imaging component
+    if (FAILED(CoCreateInstance(&CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, &IID_IWICImagingFactory,
+        (void**)&app.imaging_factory)))
+        DebugBreak();
+
     load_vulkan_library(&app);
     create_instance(&app);
     create_window(&app);
@@ -739,6 +1000,9 @@ int WINAPI wWinMain(HINSTANCE const hInstance, HINSTANCE const, PWSTR const, int
     pick_physical_device(&app);
     create_device(&app);
 
+    create_descriptor_pool(&app);
+    create_descriptor_set_layout(&app);
+    create_descriptor_set(&app);
     create_command_pool(&app);
     create_buffers(&app);
     create_renderpass(&app);
